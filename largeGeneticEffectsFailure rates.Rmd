@@ -1,0 +1,1918 @@
+---
+title: "percentageFailure"
+author: "Solomon Beer, University of Galway"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r echo=FALSE}
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(nlme)
+library(ggplot2)
+library(MASS)
+library(gridExtra)
+library(ggpubr)
+library(purrr)
+```
+
+
+```{r echo=FALSE}
+c.hw.df = read.csv("c.hw.df.csv", row.names = 1)
+hw.df = read.csv("hw.df.csv", row.names = 1)
+
+linear.complete = hw.df %>% dplyr::select(!c(cf010, cf011, cf012, cf013, cf014, cf015, cf016, cf017, cf018, cf019, cf050, cf051, cf052, cf040, cf041, cf042, cf059, cf049)) %>% drop_na() %>% group_by(cidB2758) %>% summarise(numr = n()) %>% dplyr::select(cidB2758) %>% pull()
+
+linear.df = c.hw.df %>%
+  filter(ID %in% linear.complete) %>%
+  filter(as.numeric(Wave) > 2 & as.numeric(Wave) < 9)
+```
+
+```{r echo=FALSE}
+# functions
+# play with LMM function
+# how to do p-values with log -> check maths
+lmm_function1 = function(phenoData, SNP.matrix, SNP.names){
+  
+  #phenoData = data.snp
+  colnames(phenoData) = c("ID", "Sex", "Time", "Height", "Weight")
+  phenoData$Time = phenoData$Time - mean(phenoData$Time, na.rm=T)  # centre time to "To deal with potential multicolinearity caused by adding interaction effect of SNP x time"
+  
+  ns = ncol(SNP.matrix)
+  out.lmm = matrix(rep(NA, ns*8), ncol = 8) 
+  
+  ## start time here
+  start.time = Sys.time()
+  
+  for(i in 1:ncol(SNP.matrix)){
+    
+    j.df = left_join(phenoData, data.frame(SNP.matrix[,i], ID = as.numeric(row.names(SNP.matrix))), join_by(ID))
+    colnames(j.df) = c("ID", "Sex", "Time", "Height", "Weight", "SNP")
+    mod1 = suppressWarnings(lmer(Weight ~ SNP*Time + Sex + Height + (Time | ID), data = j.df))
+    out.lmm[i,] = c(coef(summary(mod1))[2,], -(pnorm(-abs(coef(summary(mod1))[2,3]), log.p = TRUE))*log10(exp(1))-log10(2),coef(summary(mod1))[6,], -(pnorm(-abs(coef(summary(mod1))[6,3]), log.p = TRUE))*log10(exp(1))-log10(2))
+    if(i == 1){
+      # print(summary(mod1))
+      save.mod = mod1
+      }
+  }
+  
+  ## end time here
+  end.time = Sys.time()
+  
+  out.lmm = data.frame(SNP = SNP.names, out.lmm)
+  colnames(out.lmm) = c("SNP","cs.est", "cs.se", "cs.t", "cs.pval", "lon.est", "lon.se", "lon.t", "lon.pval")
+  
+  out.list = list(
+    output = out.lmm,
+    time.taken.total = end.time - start.time,
+    mod = save.mod
+  )
+  
+  return(out.list)
+  
+}
+
+gallop_function1 = function(phenoData, SNP.matrix, SNP.names, k = 6){
+  
+  #phenoData = data.snp
+  colnames(phenoData) = c("ID", "Sex", "Time", "Height", "Weight")
+  #genoData = SNP.matrix
+  
+  phenoData$Time = phenoData$Time - mean(phenoData$Time, na.rm=T)  # centre time to "To deal with potential multicolinearity caused by adding interaction effect of SNP x time"
+  
+  ## start time here
+  start.time = Sys.time()
+  
+  mod1 = lmer(Weight ~ Time + Sex + Height + (Time | ID), data = phenoData, na.action = "na.omit")
+  phenoData = phenoData[,-1] # remove ID column
+  phenoData[is.na(phenoData)] <- 0 # set NAs as 0, as per GALLOP paper
+  
+  # Extract variance components and compute penalty matrix (P)
+  varcor = VarCorr(mod1)
+  G = varcor$ID
+  sig = attr(varcor, "sc")
+  P = solve(G / sig ^ 2)
+  
+  # Put data in convenient arrays and vector
+  TT =  cbind(1, phenoData[, "Time"]) # matrix with column of ones and time at each measurement
+  nxy = ncol(phenoData)
+  X = as.matrix(cbind(1, phenoData[ , -nxy])) # data matrix with no ID or outcome column
+  nx = ncol(X)
+  y = phenoData[ , nxy] # outcome
+  
+  # Compute components of block-diagonal system with covariates  (without SNP)
+  # Additionally compute and store object SS = Rot %*% Si, which is used later on
+  ncov = 2 # number of covariates
+  n = nrow(SNP.matrix) # number of individuals
+  k = k # maximum number of outcome measurements for an individual
+  
+  A21 = matrix(NA, 2 * n , 2 + ncov)
+  q2  = rep(NA, 2 * n)
+  SS = matrix(NA, 2 * n , 2)
+  
+  for (i in 1 : n ) {
+    
+    uk = (i - 1) * k + (1 : k)
+    u2 = (i - 1) * 2 + (1 : 2)
+    Ti = TT[uk, ]
+    Si = crossprod(Ti, Ti)
+    sv = svd(Si + P)
+    Rot = sqrt(1 /sv$d) * sv$u
+    Q = Rot %*% t(Ti)
+    SS[u2, ] = Rot %*% Si
+    A21[u2, ] = Q %*% X[uk,  ]
+    q2[u2] = Q %*% y[uk]
+  }
+  
+  q1 = crossprod(X, y)
+  A11 = crossprod(X)
+  # Solve the system (20)
+  Q = A11 - crossprod(A21)
+  q = q1 - crossprod(A21, q2)
+  sol = solve(Q, q)
+  blups = q2 - A21 %*% sol
+  
+  # Compute sums of products per subject involved in the crossprod(X, G), crossprod(G) and crossprod(G, y). We use row-wise Kronecker product to avoid repeating SNP vector k times
+  ex = matrix(1, 1, ncov + 2)
+  et = matrix(1, 1, 2)
+  XTk = kronecker(et, X) * kronecker(TT, ex) ## check here for how GALLOP handles TVC
+  TTk = kronecker(et, TT) * kronecker(TT, et)
+  Tyk = y * TT
+  XTs = matrix(0, n, ncol(XTk))
+  TTs = matrix(0, n, ncol(TTk))
+  Tys = matrix(0, n, 2)
+  AtS = matrix(0, n, 2 * nx)
+  for (i in 1:n) {
+    uk = (i - 1) * k + (1 : k)
+    XTs[i, ] = apply(XTk[uk, ], 2, sum)
+    TTs[i, ] = apply(TTk[uk, ], 2, sum)
+    Tys[i, ] = apply(Tyk[uk, ], 2, sum)
+    u2 = (i - 1) * 2 + (1 : 2)
+    AtS[i, ] = c(crossprod(A21[u2, ], SS[u2, ]))
+  }
+  
+  ## SNPs start here
+  end.oneoff.time = Sys.time()
+  
+  SNPS = SNP.matrix
+  ns = ncol(SNPS)
+  
+  # Add SNPs one by one and solve
+  Theta = D = matrix(NA, ns, 2)
+  for (i in 1 : ns) {
+    si = SNPS[, i]
+    snp2 = rep(si, each = 2)
+    H1 = matrix(crossprod(si, XTs), nx, 2)
+    H2 = snp2 * SS
+    AtH = matrix(crossprod(si, AtS), nx, 2)
+    R = H1 - AtH
+    Cfix = solve(Q, R)
+    Cran = H2 - A21 %*% Cfix
+    GtG = matrix(crossprod(si ^ 2, TTs), 2, 2)
+    Gty = matrix(crossprod(si, Tys), 2, 1)
+    V = GtG - crossprod(H1, Cfix) - crossprod(H2, Cran)
+    v = Gty - crossprod(H1, sol) - crossprod(H2, blups)
+    Theta[i , ] = solve(V, v)
+    D[i, ] = diag(solve(V))
+  }
+  
+  # sig2 is sigma squared
+  
+  SE = sqrt(sig**2) * sqrt(D) # random effect covariance D is underestimated when there is a genetic effect.
+  Pval = -pnorm(-abs(Theta / SE), log.p = T)*log10(exp(1))-log10(2)
+  
+  # Does D become linear with theta?
+  # print(c(Theta[1,1], D[1,1], sqrt(sig**2)))
+  
+  ## end time here
+  end.time = Sys.time()
+  
+  # create output dataframe
+  gallop.out.df = data.frame(
+    SNP = SNP.names,
+    cs.est = Theta[,1],
+    cs.se = SE[,1],
+    cs.t = Theta[,1] / SE[,1],
+    cs.pval = Pval[,1],
+    lon.est = Theta[,2],
+    lon.se = SE[,2],
+    lon.t = Theta[,2] / SE[,2],
+    lon.pval = Pval[,2]
+  )
+  
+  out.list = list(
+    output = gallop.out.df,
+    time.taken.oneoff = end.oneoff.time - start.time,
+    time.taken.SNPs = end.time - end.oneoff.time,
+    time.taken.total = end.time - start.time
+  )
+  return(out.list)
+  
+}
+
+scebe_function1 = function(phenoData, SNP.matrix, SNP.names){
+  
+  # phenoData = data.snp
+  colnames(phenoData) = c("ID", "Sex", "Time", "Height", "Weight")
+  #mod.lm = phenoData %>% lm(formula = Weight ~ Sex) # move out of function to compare
+  #phenoData$Weight = mod.lm$residuals 
+  
+  phenoData$Time = phenoData$Time - mean(phenoData$Time, na.rm=T)
+  phenoData = phenoData %>% dplyr::select(ID,Weight,Height,Sex,Time)
+  
+  N = nrow(SNP.matrix)
+  noCov = ncol(SNP.matrix)
+  n_measure = phenoData %>% dplyr::group_by(ID) %>% dplyr::summarize(n=length(ID))%>%dplyr::select(n)%>%unlist()
+  IDs = phenoData$ID
+  
+  ## start time here
+  start.time = Sys.time()
+  
+  mod1 = lmer(Weight ~ Time + Sex + Height + (Time | ID), data = phenoData, na.action = "na.omit")
+  # remove
+  print(summary(mod1))
+  
+  flme0<-summary(mod1)
+  rf=ranef(mod1)$ID
+  r.name=rownames(rf)
+  rf1=data.frame(ID=as.numeric(r.name),rf) %>% arrange(ID)
+  rf = rf1[, -which(names(rf1)=="ID")]
+  # ind.parm <- merge(phenoData[!duplicated(phenoData$ID),c("ID",paste0("cov",1:noCov))],rf1,by="ID")
+  # names(ind.parm)[c(2+noCov,3+noCov)]=c("Inter","Slope")
+  names(rf)[c(1:2)]=c("Inter","Slope")
+  
+  # y1: rf$Inter,
+  # y2: rf$Slope
+  # X: as.matrix(genoData)
+  
+  ## NEBE with SNPS starts here <-----------------------------------------------
+  int1.time = Sys.time()
+  
+  y1 = rf$Inter
+  y2 = rf$Slope
+  X = as.matrix(SNP.matrix)
+  
+  n1 <- length(y1)
+  n<-n2<-n1
+  
+  y1bar <- mean(y1)
+  y2bar <- mean(y2)
+  
+  y1c <- y1 - y1bar
+  y2c <- y2 - y2bar
+  s1 <- colSums(X)
+  s2 <- colSums(X ^ 2)
+  sxx <- (s2 - (s1 ^ 2) / n)
+  
+  b1 <- as.vector(colSums(y1c*X) / sxx)
+  b2 <- as.vector(colSums(y2c*X) / sxx)
+  y1_sum <- sum(y1)
+  y2_sum <- sum(y2)
+  y1X <- colSums(y1 * X)
+  y2X <- colSums(y2 * X)
+  
+  #Residuals1 <- (y1 - X %*% diag(b1) - t(replicate(n1, a1))) ## still potential for improvement
+  #b1_sd <- sqrt((colSums(Residuals1 ^ 2) / (n1 - 2)) / sxx)
+  #Residuals2 <- (y2 - X %*% diag(b2) - t(replicate(n2, a2))) ## still potential for improvement
+  #b2_sd <- sqrt((colSums(Residuals2 ^ 2) / (n2 - 2)) / sxx)
+  
+  sigma11 = sum(y1 ^ 2) - (y1_sum ^ 2 * s2 - 2 * s1 * y1_sum * y1X + 
+                             n * (y1X) ^ 2) / (n * sxx)
+  var.gamma11 = sigma11 / (sxx * (n - 2))
+  
+  #sigma12 = sum(y1 * y2) - (y1_sum * y2_sum * s2 - y2_sum * s1 * y1X - 
+  #                           y1_sum * s1 * y2X + n * y1X * y2X) / (n * sxx)
+  #var.gamma12 = sigma12 / (sxx * (n - 2))
+  
+  sigma22 = sum(y2 ^ 2) - (y2_sum ^ 2 * s2 - 2 * s1 * y2_sum * y2X + 
+                             n * (y2X) ^ 2) / (n * sxx)
+  var.gamma22 = sigma22 / (sxx * (n - 2))
+  
+  b1_sd=sqrt(var.gamma11)
+  b2_sd=sqrt(var.gamma22)
+  
+  
+  t1_value <- b1 / b1_sd
+  p1_value <- pt(q = -abs(t1_value), df =  n1 - 2) * 2 # Pr(>|t|)
+  
+  t2_value <- b2 / b2_sd
+  p2_value <- pt(q = -abs(t2_value), df =  n2 - 2) * 2 # Pr(>|t|)
+  
+  
+  result <- cbind(b1, b1_sd, p1_value,b2, b2_sd,  p2_value)
+  colnames(result) <- c("b1_Est", "b1_Std",  "Pr1(>|t|)","b2_Est", "b2_Std",  "Pr2(>|t|)")
+  rownames(result) <- colnames(X)
+  
+  # nebe with SNPs ends here <--------------------------------------------------
+  int2.time = Sys.time()
+  
+  spr = result
+  
+  Data=phenoData
+  R=matrix(as.numeric(VarCorr(mod1)$ID),ncol=2)
+  Ip=diag(1,2)
+   print(R)
+  
+  #allS=allW=list()
+  #allM=allISMIS=list()	  
+  alls11=alls12=alls21=alls22=NULL
+  allw11=allw12=allw21=allw22=NULL
+  allsms11=allsms12=allsms21=allsms22=NULL
+  
+  Time.lst = split(Data[["Time"]], Data[["ID"]])
+  
+  #print(Time.lst)
+  
+  for(i in 1:N){ ## this loop does not involve SNPs, I believe
+    nt = n_measure[i]
+    time <- Time.lst[[i]] #Data[Data$ID ==i, Time]##
+    Zi <- cbind(1, time)
+    Gi = diag(sigma(mod1) ^ 2, nt)
+    ZinvGZ <- crossprod(Zi, solve(Gi, Zi)) ##when n measure==1, return error!
+    Mi=R+ginv(ZinvGZ)
+    
+    SIGMAi=Zi%*%R%*%t(Zi)+Gi
+    Wi <- crossprod(Zi, solve(SIGMAi, Zi))
+    #allW[[i]]=Wi
+    allw11=c(allw11,Wi[1,1])
+    allw12=c(allw12,Wi[1,2])
+    allw21=c(allw21,Wi[2,1])
+    allw22=c(allw22,Wi[2,2])
+    
+    
+    
+    invSi <- R %*% ZinvGZ + Ip
+    Si=solve(invSi)
+    alls11<-c(alls11,Si[1,1])
+    alls12<-c(alls12,Si[1,2])
+    alls21<-c(alls21,Si[2,1])
+    alls22<-c(alls22,Si[2,2])
+    
+    Ipi=diag(1,2)
+    SMS=(Ipi-Si)%*%Mi%*%t(Ipi-Si)
+    
+    allsms11<-c(allsms11,SMS[1,1])
+    allsms12<-c(allsms12,SMS[1,2])
+    allsms21<-c(allsms21,SMS[2,1])
+    allsms22<-c(allsms22,SMS[2,2])
+    
+  }
+  
+  print(SIGMAi)
+  print(Wi)
+  print(invSi)
+  print(Si)
+  
+  C<-matrix(c(sum(allw11),sum(allw12),sum(allw21),sum(allw22)),2,byrow=T)
+    print(C)
+  
+  inv_C<-solve(C)
+   print(inv_C)
+  
+  invc11<-inv_C[1,1]
+  invc12<-inv_C[1,2]
+  invc21<-inv_C[2,1]
+  invc22<-inv_C[2,2]
+  
+  ebe<-spr[,c(1,4)]
+  
+  # SNP section starts here
+  end.oneoff.time = Sys.time()
+  
+  myX<-SNP.matrix #unique(phenoData[,5:(noCov+4)]) ## SNPs start again here
+  Xc<-apply(myX,2,function(x){scale(x,scale=F)})
+  
+  XcX<-Xc*myX
+  Xc2<-Xc^2
+  Sxc2<-colSums(Xc2)
+  
+  xstar11<-colSums(allw11*Xc)
+  xstar12<-colSums(allw12*Xc)
+  xstar21<-colSums(allw21*Xc)
+  xstar22<-colSums(allw22*Xc)
+  
+  A11<-colSums(Xc2*alls11)/Sxc2
+  A12<-colSums(Xc2*alls12)/Sxc2
+  A21<-colSums(Xc2*alls21)/Sxc2
+  A22<-colSums(Xc2*alls22)/Sxc2
+  
+  B11<-colSums(Xc*alls11)/Sxc2
+  B12<-colSums(Xc*alls12)/Sxc2
+  B21<-colSums(Xc*alls21)/Sxc2
+  B22<-colSums(Xc*alls22)/Sxc2
+  
+  Sxc22<-(Sxc2)^2
+  
+  D11=colSums(Xc2*allsms11)/Sxc22
+  D12=colSums(Xc2*allsms12)/Sxc22
+  D21=colSums(Xc2*allsms21)/Sxc22
+  D22=colSums(Xc2*allsms22)/Sxc22
+  
+  
+  
+  ssh211<-B11*invc11*xstar11+B12*invc21*xstar11+B11*invc12*xstar21+B12*invc22*xstar21
+  ssh212<-B11*invc11*xstar12+B12*invc21*xstar12+B11*invc12*xstar22+B12*invc22*xstar22
+  ssh221<-B21*invc11*xstar11+B22*invc21*xstar11+B21*invc12*xstar21+B22*invc22*xstar21
+  ssh222<-B21*invc11*xstar12+B22*invc21*xstar12+B21*invc12*xstar22+B22*invc22*xstar22
+  
+  print(B21[100])
+  print(invc11)
+  print(xstar12[100])
+  print(B22[100])
+  print(invc21)
+  print(xstar12[100])
+  print(B21[100])
+  print(invc12)
+  print(xstar22[100])
+  print(B22[100])
+  print(invc22)
+  print(xstar22[100])
+  
+  print(c(A11[100],A12[100],A21[100],A22[100]))
+  print(sprintf("%.35f",A11[100]))
+  print(sprintf("%.35f",A22[100]))
+  
+  print(c(ssh211[100],ssh212[100],ssh221[100],ssh222[100]))
+  print(sprintf("%.35f",ssh211[100]))
+  print(sprintf("%.35f",ssh222[100]))
+  
+  ssh11=1-A11+ssh211
+  ssh12=0-A12+ssh212
+  ssh21=0-A21+ssh221
+  ssh22=1-A22+ssh222
+  
+   print(c(ssh11[100], ssh12[100], ssh21[100], ssh22[100]))
+  
+  detssh=ssh11*ssh22-ssh12*ssh21
+  
+   print(sprintf("%.35f",ssh11[100]))
+   print(sprintf("%.35f",ssh22[100]))
+   print(sprintf("%.35f",ssh12[100]))
+   print(sprintf("%.35f",ssh21[100]))
+   print((ssh11*ssh22)[100])
+   print(sprintf("%.35f",(ssh11*ssh22)[100]))
+   print((ssh12*ssh21)[100])
+   print(sprintf("%.35f",(ssh12*ssh21)[100]))
+   print(detssh[100])
+  
+  invssh11<-ssh22/detssh
+  invssh12<-(-ssh12/detssh)
+  invssh21<-(-ssh21/detssh)
+  invssh22<-ssh11/detssh
+  
+  Vgamma211<-B11*invc11*B11+B12*invc21*B11+B11*invc12*B12+B12*invc22*B12
+  #Vgamma211<-Vgamma211/SXc2
+  Vgamma212<-B11*invc11*B21+B12*invc21*B21+B11*invc12*B22+B12*invc22*B22
+  #Vgamma212<-Vgamma212/SXc2
+  Vgamma221<-B21*invc11*B11+B22*invc21*B11+B21*invc12*B12+B22*invc22*B12
+  #Vgamma221<-Vgamma221/SXc2
+  Vgamma222<-B21*invc11*B21+B22*invc21*B21+B21*invc12*B22+B22*invc22*B22
+  #Vgamma222<-Vgamma222/SXc2
+  
+  Vgamma11=D11-Vgamma211
+  Vgamma12=D12-Vgamma212
+  Vgamma21=D21-Vgamma221
+  Vgamma22=D22-Vgamma222 ###VAR of NEBE
+  
+  Vssh11<-invssh11*Vgamma11*invssh11+invssh12*Vgamma21*invssh11+invssh11*Vgamma12*invssh12+invssh12*Vgamma22*invssh12
+  Vssh12<-invssh11*Vgamma11*invssh21+invssh12*Vgamma21*invssh21+invssh11*Vgamma12*invssh22+invssh12*Vgamma22*invssh22
+  Vssh21<-invssh21*Vgamma11*invssh11+invssh22*Vgamma21*invssh11+invssh21*Vgamma12*invssh12+invssh22*Vgamma22*invssh12
+  Vssh22<-invssh21*Vgamma11*invssh21+invssh22*Vgamma21*invssh21+invssh21*Vgamma12*invssh22+invssh22*Vgamma22*invssh22
+  
+  # remove
+  print(c(invssh11[100], invssh12[100], invssh21[100], invssh22[100]))
+  print(c(Vgamma11[100], Vgamma12[100], Vgamma21[100], Vgamma22[100]))
+  print(c(Vssh11[100], Vssh12[100], Vssh21[100], Vssh22[100]))
+  
+  print(Vssh22)
+  
+  # addition for single SNP input ---------------------------------------------<
+#  ebe = matrix(ebe, ncol = 2)
+  
+  est.ssh.inter<-invssh11*ebe[,1]+invssh12*ebe[,2]
+  est.ssh.slope<-invssh21*ebe[,1]+invssh22*ebe[,2]
+  
+  t.ssh.inter<-est.ssh.inter/sqrt(Vssh11)
+  t.ssh.slope<-est.ssh.slope/sqrt(Vssh22)
+  
+  p.ssh.inter<- -pnorm(abs(t.ssh.inter),lower.tail=F,log.p = T)*log10(exp(1))-log10(2)
+  p.ssh.slope<- -pnorm(abs(t.ssh.slope),lower.tail=F,log.p = T)*log10(exp(1))-log10(2)
+  
+  # print(is.na(p.ssh.inter)[100])
+  # print(is.na(p.ssh.slope)[100])
+  
+  ## end time here
+  end.time = Sys.time()
+  
+  output<-cbind(est.ssh.inter,sqrt(Vssh11),p.ssh.inter,t.ssh.inter,est.ssh.slope,sqrt(Vssh22),p.ssh.slope,t.ssh.slope)
+  
+  colnames(output)= c("est.sc.b1", "se.sc.b1", "p.sc.b1", "t.sc.b1",
+                      "est.sc.b2", "se.sc.b2", "p.sc.b2", "t.sc.b2")
+  
+  out.scebe.res = data.frame(SNP = SNP.names, matrix(output[,c(1:2,4,3,5:6,8,7)], ncol = 8))
+  row.names(out.scebe.res) = seq(1,nrow(out.scebe.res),1)
+  colnames(out.scebe.res) = c("SNP","cs.est", "cs.se", "cs.t", "cs.pval", "lon.est", "lon.se", "lon.t", "lon.pval")
+  
+  out.list = list(
+    output = out.scebe.res,
+    time.taken.oneoff = int1.time - start.time + end.oneoff.time - int2.time,
+    time.taken.SNPs = end.time - end.oneoff.time + int2.time - int1.time,
+    time.taken.total = end.time - start.time
+  )
+  
+  return(out.list)
+  
+}
+
+new_plot_function = function(df){
+  
+  p1 = df %>%
+    ggplot(aes(x = lmm.cs.est, y = cs.est, colour = method.x)) +
+    geom_point(alpha=0.2) +
+    geom_abline(alpha=0.7) +
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1)) +
+    xlab("LMM estimate") +
+    ylab("Approximate estimate") +
+    labs(title = "Cross-sectional effect")  +
+    guides(colour=guide_legend(title="Method"))
+
+  p2 = df %>% 
+    ggplot(aes(x = lmm.cs.pval, y = cs.pval, colour = method.x)) +
+    geom_point(alpha=0.2) +
+    geom_abline(alpha=0.7) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1)) +
+    xlab("LMM estimate") +
+    ylab("Approximate estimate") +
+    labs(title = "Cross-sectional logged p-value")  +
+    guides(colour=guide_legend(title="Method"))
+  
+  p3 = df %>%
+    ggplot(aes(x = lmm.lon.est, y = lon.est, colour = method.x)) +
+    geom_point(alpha=0.2) +
+    geom_abline(alpha=0.7) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1)) +
+    xlab("LMM estimate") +
+    ylab("Approximate estimate")  +
+    labs(title = "Longitudinal effect estimate")  +
+    guides(colour=guide_legend(title="Method"))
+
+  p4 = df %>%
+    ggplot(aes(x = lmm.lon.pval, y = lon.pval, colour = method.x)) +
+    geom_point(alpha=0.2) +
+    geom_abline(alpha=0.7) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 20, vjust = 1, hjust = 1)) +
+    xlab("LMM estimate") +
+    ylab("Approximate estimate")  +
+    labs(title = "Longitudinal logged p-value")  +
+    guides(colour=guide_legend(title="Method"))
+  
+  out.plot = ggarrange(p1,p2,p3,p4, nrow = 2, ncol = 2, common.legend = T, legend = "bottom")
+  return(out.plot)
+  
+}
+
+simulate_SNPs = function(N.SNP, data, MAF.unif.min = 0.05, MAF.unif.max = 0.5){
+  
+  cid.list = data %>% dplyr::select(ID) %>% unique() # list of ids
+  N.ind = length(cid.list[[1]]) # number of individuals
+  
+  oo = seq(1,N.SNP,1) # label each SNP
+  col.snp.names = rep(NA,N.SNP)
+  for(i in 1:N.SNP){
+    col.snp.names[i] = paste0("SNP.",i)
+  }
+  
+  # simulate SNPs
+  SNP.matrix = matrix(rep(NA,N.SNP*N.ind), ncol = N.SNP)
+  MAF.SNP = runif(N.SNP, min = MAF.unif.min, max = MAF.unif.max)
+  for(i in 1:N.SNP){
+    SNP.matrix[,i] = rbinom(N.ind,2,MAF.SNP[i])
+  }
+  
+  row.names(SNP.matrix) = cid.list[[1]] # IDs as row names
+  colnames(SNP.matrix) = col.snp.names  # labelled SNPs as column names
+ 
+  out.list = list(
+    SNP.matrix = SNP.matrix,
+    SNP.MAFs = MAF.SNP
+  )
+  
+  return(out.list) 
+}
+
+# function for very large genetic contribution
+simulate_SNP_effects = function(data, SNP.matrix, cross.unif.lower = 0, cross.unif.higher = 0.4,
+                                             long.unif.lower = 0, long.unif.higher = 0.1,
+         large.cs = 0, large.lon = 0, n.sd=0.01){
+  
+  # N.SNP
+  N.SNP = ncol(SNP.matrix)
+  
+  # simulate SNP coefficients
+  SNP.betas = matrix(c(runif(N.SNP,cross.unif.lower,cross.unif.higher),runif(N.SNP,long.unif.lower,long.unif.higher)), ncol = 2) # SNP beta bounds
+  row.names(SNP.betas) = colnames(SNP.matrix)
+  colnames(SNP.betas) = c("cs","lon")
+  
+  
+  # adjust cs for lon effect at t0 = 1.5y
+  data$Weight = 0 + rnorm(nrow(data),0,n.sd)
+  SNP.betas[1,] = c(large.cs, large.lon)
+  SNP.betas[,1] = SNP.betas[,1] - 1.537*SNP.betas[,2]
+  
+  
+  # multiply SNP dose with coefficient and sum
+  # gives a column for cross sectional and longitudinal
+  # longitudinal them multiplied by time in following step
+  sa = t(SNP.betas) %*% t(SNP.matrix)
+  row.names(sa) = c("cs","lon")
+  sa.df = data.frame(t(sa),
+                     ID = colnames(sa)) %>% 
+    mutate(ID = as.integer(ID))
+  
+  # create df and calculate outcome with additional SNP effects
+  data.snp = data %>% left_join(sa.df,by = join_by(ID)) %>%
+    mutate(adj.Weight = Weight + cs + lon*Age.years) %>% # TO ADD - when analysing data generated from this, need to adjust for time centre-ing used by methods at the end - other wise overestimation of cs effects
+    dplyr::select(ID,Sex,Wave,Age.years,Height,adj.Weight) %>%  data.frame()
+  row.names(data.snp) = seq(1,length(data.snp$ID),1)
+  colnames(data.snp) = c("ID", "Sex", "Wave", "Age.years", "Height", "Weight")
+  
+  out.list = list(
+    data.SNP.effects = data.snp,
+    SNP.betas = SNP.betas
+  )
+  
+ return(out.list)
+}
+```
+
+```{r echo=FALSE}
+# tryCatch wrappers
+lmm_tryCatch = function(phenoData, SNP.matrix, SNP.names){
+  tryCatch(
+    #this is the chunk of code we want to run
+    {out = lmm_function1(phenoData, SNP.matrix, SNP.names)$output
+      return(list(lmm = out, run = 1))
+      
+      #when it throws an error, the following block catches the error
+    }, error = function(msg){
+      return(list(lmm = NA, run = 0))
+    })
+}
+gallop_tryCatch = function(phenoData, SNP.matrix, SNP.names){
+  tryCatch(
+    #this is the chunk of code we want to run
+    {out = gallop_function1(phenoData, SNP.matrix, SNP.names)
+      return(list(gallop = out, run = 1))
+      
+      #when it throws an error, the following block catches the error
+    }, error = function(msg){
+      return(list(gallop = NA, run = 0))
+    })
+}
+scebe_tryCatch = function(phenoData, SNP.matrix, SNP.names){
+  tryCatch(
+    #this is the chunk of code we want to run
+    {scebe.out = scebe_function1(phenoData, SNP.matrix, SNP.names)
+      return(list(scebe = scebe.out$output,
+                  run = c(1,sum(!is.na(scebe.out$output$cs.pval)),sum(!is.na(scebe.out$output$lon.pval)))))
+      
+      #when it throws an error, the following block catches the error
+    }, error = function(msg){
+      return(list(scebe = NA, run = c(0,0,0)))
+    })
+}
+```
+
+```{r echo=FALSE}
+# fs 
+# read fail.list and make table
+f = function(x){
+  row = unname(c(x$maf, x$lmm$run, x$gallop$run, x$scebe$run))
+  return(row)
+}
+
+f2 = function(x){
+  if(length(x$gallop$gallop)==1){
+    gallop = data.frame(matrix(rep(NA, 800), ncol = 8, nrow = 100))
+    colnames(gallop) = colnames(x$lmm$lmm[2:9])
+    gallop$SNP = x$lmm$lmm$SNP
+    iter = rbind(x$lmm$lmm, gallop, x$scebe$scebe)
+    iter$method = c(rep("LMM", 100), rep("GALLOP", 100), rep("SCEBE", 100))
+  }
+  else{
+    iter = rbind(rbind(x$lmm$lmm, x$gallop$gallop$output), x$scebe$scebe)
+    iter$method = c(rep("LMM", 100), rep("GALLOP", 100), rep("SCEBE", 100))
+  }
+  return(iter)
+}
+
+f3 = function(x){
+  return(x)
+}
+```
+
+### Extremely low non-genetic variance and only cross-sectional genetic effects
+```{r echo=FALSE, warning=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.05, MAF.unif.max = 0.5)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.05, large.lon = 0)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+res.list = map(fail.list, f2)
+res.df = map_df(res.list, f3)
+
+df.fr = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(df.fr) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+df.fr$scen = "onlyExtremeCS"
+
+# df.fr
+res.df
+```
+
+```{r echo=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  print(i)
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.05, MAF.unif.max = 0.5)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.02, large.lon = 0)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+res.list2 = map(fail.list, f2)
+res.df2 = map_df(res.list2, f3)
+
+
+df2.fr = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(df2.fr) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+df2.fr$scen = "onlyLargeCS"
+
+df2.fr %>% summary()
+
+```
+
+```{r echo=FALSE}
+# function for longi effect
+simulate_SNP_effects = function(data, SNP.matrix, cross.unif.lower = 0, cross.unif.higher = 0.4,
+                                             long.unif.lower = 0, long.unif.higher = 0.1,
+         large.cs = 0, large.lon = 0, n.sd = 0.01){
+  
+  # N.SNP
+  N.SNP = ncol(SNP.matrix)
+  
+  # simulate SNP coefficients
+  SNP.betas = matrix(c(runif(N.SNP,cross.unif.lower,cross.unif.higher),runif(N.SNP,long.unif.lower,long.unif.higher)), ncol = 2) # SNP beta bounds
+  row.names(SNP.betas) = colnames(SNP.matrix)
+  colnames(SNP.betas) = c("cs","lon")
+  
+  
+  # adjust cs for lon effect at t0 = 1.5y
+  data$Weight = 0 + rnorm(nrow(data),0,n.sd)
+  SNP.betas[1,] = c(large.cs, large.lon)
+  SNP.betas[,1] = SNP.betas[,1] - 1.537*SNP.betas[,2]
+  
+  
+  # multiply SNP dose with coefficient and sum
+  # gives a column for cross sectional and longitudinal
+  # longitudinal them multiplied by time in following step
+  sa = t(SNP.betas) %*% t(SNP.matrix)
+  row.names(sa) = c("cs","lon")
+  sa.df = data.frame(t(sa),
+                     ID = colnames(sa)) %>% 
+    mutate(ID = as.integer(ID))
+  
+  # create df and calculate outcome with additional SNP effects
+  data.snp = data %>% left_join(sa.df,by = join_by(ID)) %>%
+    mutate(adj.Weight = Weight + cs + lon*Age.years) %>% # TO ADD - when analysing data generated from this, need to adjust for time centre-ing used by methods at the end - other wise overestimation of cs effects
+    dplyr::select(ID,Sex,Wave,Age.years,Height,adj.Weight) %>%  data.frame()
+  row.names(data.snp) = seq(1,length(data.snp$ID),1)
+  colnames(data.snp) = c("ID", "Sex", "Wave", "Age.years", "Height", "Weight")
+  
+  out.list = list(
+    data.SNP.effects = data.snp,
+    SNP.betas = SNP.betas
+  )
+  
+ return(out.list)
+}
+```
+
+```{r echo=FALSE, warning=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  print(i)
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.05, MAF.unif.max = 0.5)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.05, large.lon = 0.005)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+res.list3 = map(fail.list, f2)
+res.df3 = map_df(res.list3, f3)
+
+
+
+df3.fr = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(df3.fr) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+df3.fr$scen = "CSandLon"
+
+df3.fr %>% summary()
+```
+
+```{r echo=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  print(i)
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.05, MAF.unif.max = 0.5)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.05, large.lon = 0.005, n.sd = 0.1)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+res.list4 = map(fail.list, f2)
+res.df4 = map_df(res.list4, f3)
+
+
+
+df4.fr = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(df4.fr) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+df4.fr$scen = "noisyCSandLon"
+
+df4.fr %>% summary()
+```
+
+```{r echo=FALSE}
+
+fr.df = rbind(rbind(rbind(df.fr, df2.fr), df3.fr), df4.fr)
+fr.df
+
+write.csv(fr.df, "failrates.csv", row.names = F)
+```
+
+```{r echo=FALSE}
+# read in fail rates
+fr = read.csv("failrates.csv")
+fr %>% group_by(scen) %>% summarise(GALLOP = mean(GALLOP), SCEBE = mean(SCEBE), SCEBE.fr = mean(SCEBE.LON))
+```
+
+```{r echo=FALSE}
+res = rbind(rbind(rbind(res.df, res.df2), res.df3), res.df4)
+res$genetic = c(rep("Extreme CS", 30000), rep("CS", 30000), rep("CS and Lon", 30000), rep("Noisy CS and Lon", 30000))
+
+# write.csv(res, file = "lGenRes.csv", row.names = F)
+```
+
+```{r echo=FALSE}
+res = read.csv("lGenRes.csv")
+res.lmm = res %>% mutate(iter = rep(rep(1:100, each=300),4)) %>% filter(method == "LMM")
+colnames(res.lmm) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "genetic", "iter")
+res.scebe = res %>% mutate(iter = rep(rep(1:100, each=300),4)) %>% filter(method == "SCEBE")
+res.gallop = res %>% mutate(iter = rep(rep(1:100, each=300),4)) %>% filter(method == "GALLOP")
+full.res = rbind(left_join(res.scebe, res.lmm, by  = join_by(genetic, iter, SNP)), left_join(res.gallop, res.lmm, by  = join_by(genetic, iter, SNP)))
+
+# write.csv(full.res, "full.results.lGen.csv", row.names = F)
+
+gallop.fail.list = full.res %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+full.res = full.res %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p11 = new_plot_function(full.res %>% filter(iter %in% gallop.fail.list & method.x == "SCEBE") %>% filter(genetic == "Extreme CS") %>% arrange(desc(method.x)))
+p21 = new_plot_function(full.res %>% filter(iter %in% gallop.fail.list & method.x == "SCEBE") %>% filter(genetic == "CS") %>% arrange(desc(method.x)))
+p31 = new_plot_function(full.res %>% filter(iter %in% gallop.fail.list & method.x == "SCEBE") %>% filter(genetic == "CS and Lon") %>% arrange(desc(method.x)))
+p41 = new_plot_function(full.res %>% filter(iter %in% gallop.fail.list & method.x == "SCEBE") %>% filter(genetic == "Noisy CS and Lon") %>% arrange(desc(method.x)))
+
+p12 = new_plot_function(full.res %>% filter(!iter %in% gallop.fail.list) %>% filter(genetic == "Extreme CS") %>% arrange(desc(method.x)))
+p22 = new_plot_function(full.res %>% filter(!iter %in% gallop.fail.list) %>% filter(genetic == "CS") %>% arrange(desc(method.x)))
+p32 = new_plot_function(full.res %>% filter(!iter %in% gallop.fail.list) %>% filter(genetic == "CS and Lon") %>% arrange(desc(method.x)))
+p42 = new_plot_function(full.res %>% filter(!iter %in% gallop.fail.list) %>% filter(genetic == "Noisy CS and Lon") %>% arrange(desc(method.x)))
+
+
+
+p1 = ggarrange(p11,p12,nrow=2,labels=c("A","B"))
+p2 = ggarrange(p21,p22,nrow=2,labels=c("A","B"))
+p3 = ggarrange(p31,p32,nrow=2,labels=c("A","B"))
+p4 = ggarrange(p41,p42,nrow=2,labels=c("A","B"))
+
+
+ggsave(filename = "ExtremeCs.jpg", plot = p1, width = 210, height = 297, units = "mm")
+ggsave(filename = "nCs.jpg", plot = p2, width = 210, height = 297, units = "mm")
+ggsave(filename = "CsAndLon.jpg", plot = p3, width = 210, height = 297, units = "mm")
+ggsave(filename = "nCsandLon.jpg", plot = p4, width = 210, height = 297, units = "mm")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+set.seed(2512)
+
+#### include this one!!!! ds = 0.01
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.025*0.01*i, large.lon = 0)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+inc.res.list = map(fail.list, f2)
+inc.res.df = map_df(inc.res.list, f3)
+
+inc.df.fr = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(inc.df.fr) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+inc.df.fr$scen = "increasingCS"
+
+inc.df.fr %>% filter(GALLOP == 1 & SCEBE.LON != 100)
+# df.fr
+# inc.res.df
+
+inc.res.lmm = inc.res.df %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "LMM")
+colnames(inc.res.lmm) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "iter")
+inc.res.scebe = inc.res.df %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "SCEBE")
+inc.res.gallop = inc.res.df %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "GALLOP")
+inc.full.res = rbind(left_join(inc.res.scebe, inc.res.lmm, by  = join_by(iter, SNP)), left_join(inc.res.gallop, inc.res.lmm, by  = join_by(iter, SNP)))
+
+#inc.full.res
+#inc.df.fr
+gallop.fail.list2 = inc.full.res %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+inc.full.res = inc.full.res %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p51 = new_plot_function(inc.full.res %>% filter(iter %in% gallop.fail.list2 & method.x == "SCEBE") %>% arrange(desc(method.x)))
+p52 = new_plot_function(inc.full.res %>% filter(!iter %in% gallop.fail.list2) %>% arrange(desc(method.x)))
+
+p5 = ggarrange(p51,p52,nrow=2,labels=c("A","B"))
+ggsave(filename = "increasingCs.jpg", plot = p5, width = 210, height = 297, units = "mm")
+
+write.csv(inc.full.res, "increasingCS.csv", row.names = F)
+```
+```{r echo=FALSE, warning=FALSE}
+gse = read.csv("GALLOPse.csv")
+colnames(gse) = c("Theta", "D", "sig")
+
+gse %>% ggplot(aes(x = Theta, y = D)) +
+  geom_point() +
+  theme_minimal()
+
+gse %>% ggplot(aes(x = Theta, y = sig)) +
+  geom_point() +
+  theme_minimal()
+
+gse %>% ggplot(aes(x = scale(Theta), y = scale(sqrt(sig**2)*sqrt(D)))) +
+  geom_point() +
+  geom_abline(colour = "red", alpha = 0.4) +
+  theme_minimal()
+
+gse %>% ggplot(aes(x = Theta, y = sqrt(sig**2)*sqrt(D))) +
+  geom_point() +
+  theme_minimal()
+
+gse %>% ggplot(aes(x = Theta, y = Theta/(sqrt(sig**2)*sqrt(D)))) +
+  geom_point() +
+  theme_minimal()
+
+inc.res.lmm[c(seq(1,100)*100-99),] %>% ggplot(aes(x=lmm.cs.est,y=lmm.cs.t)) +
+  geom_point() + 
+  theme_minimal()
+
+ggplot() + 
+  geom_point(aes(x=gse$Theta,y=gse$Theta/(sqrt(gse$sig**2)*sqrt(gse$D))), colour="red") +
+  geom_point(aes(x=gse$Theta, y=inc.res.lmm[c(sort(sample(seq(1,100),60)*100-99)),]$lmm.cs.t), colour="blue") +
+  theme_minimal() +
+  labs(title = "t-statistics")
+
+ggplot() + 
+  geom_point(aes(x=gse$Theta,y=(sqrt(gse$sig**2)*sqrt(gse$D))), colour="red") +
+  geom_point(aes(x=gse$Theta, y=inc.res.lmm[c(sort(sample(seq(1,100),60)*100-99)),]$lmm.cs.se), colour="blue") +
+  theme_minimal() +
+   labs(title = "standard errors")
+
+q1 = ggplot(inc.res.df[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = cs.t, colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "t-statistic") +
+  xlab("CS SNP effect") +
+  ylab("CS t-statistic estimate")
+
+q2 = ggplot(inc.res.df[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = ifelse(cs.se < 0.1 & cs.se > 0, cs.se, NA), colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "Standard errors") + 
+  xlab("CS SNP effect") +
+  ylab("CS standard error estimate")
+
+ggarrange(q2,q1, labels = c("A","B"), common.legend = T)
+```
+
+
+```{r echo=FALSE}
+set.seed(2512)
+
+### and include this one
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.025*0.01*i, large.lon = 0, n.sd = 0.025)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+inc.res.list2 = map(fail.list, f2)
+inc.res.df2 = map_df(inc.res.list2, f3)
+
+inc.df.fr2 = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(inc.df.fr2) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+inc.df.fr2$scen = "increasingCS2"
+
+# df.fr
+# inc.res.df
+
+inc.res.lmm2 = inc.res.df2 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "LMM")
+colnames(inc.res.lmm2) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "iter")
+inc.res.scebe2 = inc.res.df2 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "SCEBE")
+inc.res.gallop2 = inc.res.df2 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "GALLOP")
+inc.full.res2 = rbind(left_join(inc.res.scebe2, inc.res.lmm2, by  = join_by(iter, SNP)), left_join(inc.res.gallop2, inc.res.lmm2, by  = join_by(iter, SNP)))
+
+gallop.fail.list3 = inc.full.res2 %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+inc.full.res2 = inc.full.res2 %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p61 = new_plot_function(inc.full.res2 %>% filter(iter %in% gallop.fail.list3 & method.x == "SCEBE") %>% arrange(desc(method.x)))
+p62 = new_plot_function(inc.full.res2 %>% filter(!iter %in% gallop.fail.list3) %>% arrange(desc(method.x)))
+
+p6 = ggarrange(p61,p62,nrow=2,labels=c("A","B"))
+ggsave(filename = "increasingCsNoise.jpg", plot = p6, width = 210, height = 297, units = "mm")
+
+write.csv(inc.full.res2, "increasingCS2.csv", row.names = F)
+```
+
+```{r echo=FALSE, message=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.005, large.lon = 0.005*0.01*i, n.sd = 0.01)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+inc.res.list3 = map(fail.list, f2)
+inc.res.df3 = map_df(inc.res.list3, f3)
+
+inc.df.fr3 = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(inc.df.fr3) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+inc.df.fr3$scen = "increasingLon"
+
+# df.fr
+# inc.res.df
+
+inc.res.lmm3 = inc.res.df3 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "LMM")
+colnames(inc.res.lmm3) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "iter")
+inc.res.scebe3 = inc.res.df3 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "SCEBE")
+inc.res.gallop3 = inc.res.df3 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "GALLOP")
+inc.full.res3 = rbind(left_join(inc.res.scebe3, inc.res.lmm3, by  = join_by(iter, SNP)), left_join(inc.res.gallop3, inc.res.lmm3, by  = join_by(iter, SNP)))
+
+#inc.full.res
+#inc.df.fr
+
+gallop.fail.list4 = inc.full.res3 %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+inc.full.res3 = inc.full.res3 %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p71 = new_plot_function(inc.full.res3 %>% filter(iter %in% gallop.fail.list4 & method.x == "SCEBE") %>% arrange(desc(method.x)))
+p72 = new_plot_function(inc.full.res3 %>% filter(!iter %in% gallop.fail.list4) %>% arrange(desc(method.x)))
+
+p7 = ggarrange(p71,p72,nrow=2,labels=c("A","B"))
+ggsave(filename = "increasingLon.jpg", plot = p7, width = 210, height = 297, units = "mm")
+write.csv(inc.full.res3, "increasingLon.csv", row.names = F)
+```
+
+```{r echo=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.005, large.lon = 0.005*0.01*i, n.sd = 0.1)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+inc.res.list4 = map(fail.list, f2)
+inc.res.df4 = map_df(inc.res.list4, f3)
+
+inc.df.fr4 = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(inc.df.fr4) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+inc.df.fr4$scen = "increasingLon2"
+
+# df.fr
+# inc.res.df
+
+inc.res.lmm4 = inc.res.df4 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "LMM")
+colnames(inc.res.lmm4) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "iter")
+inc.res.scebe4 = inc.res.df4 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "SCEBE")
+inc.res.gallop4 = inc.res.df4 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "GALLOP")
+inc.full.res4 = rbind(left_join(inc.res.scebe4, inc.res.lmm4, by  = join_by(iter, SNP)), left_join(inc.res.gallop4, inc.res.lmm4, by  = join_by(iter, SNP)))
+
+inc.full.res4
+inc.df.fr4
+
+gallop.fail.list5 = inc.full.res4 %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+inc.full.res4 = inc.full.res4 %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p81 = new_plot_function(inc.full.res4 %>% filter(iter %in% gallop.fail.list5 & method.x == "SCEBE") %>% arrange(desc(method.x)))
+p82 = new_plot_function(inc.full.res4 %>% filter(!iter %in% gallop.fail.list5) %>% arrange(desc(method.x)))
+
+p8 = ggarrange(p81,p82,nrow=2,labels=c("A","B"))
+ggsave(filename = "increasingLon2.jpg", plot = p8, width = 210, height = 297, units = "mm")
+
+write.csv(inc.full.res4, "increasingLon2.csv", row.names = F)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+## run from here after 24/07
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.025*0.01*i, large.lon = 0.005*0.01*i+rnorm(1,0,0.0005), n.sd = 0.1)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+inc.res.list5 = map(fail.list, f2)
+inc.res.df5 = map_df(inc.res.list5, f3)
+
+inc.df.fr5 = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(inc.df.fr5) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+inc.df.fr5$scen = "increasingIncreasing"
+
+# df.fr
+# inc.res.df
+
+inc.res.lmm5 = inc.res.df5 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "LMM")
+colnames(inc.res.lmm5) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "iter")
+inc.res.scebe5 = inc.res.df5 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "SCEBE")
+inc.res.gallop5 = inc.res.df5 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "GALLOP")
+inc.full.res5 = rbind(left_join(inc.res.scebe5, inc.res.lmm5, by  = join_by(iter, SNP)), left_join(inc.res.gallop5, inc.res.lmm5, by  = join_by(iter, SNP)))
+
+#inc.full.res4
+#inc.df.fr4
+
+gallop.fail.list6 = inc.full.res5 %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+inc.full.res5 = inc.full.res5 %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p91 = new_plot_function(inc.full.res5 %>% filter(iter %in% gallop.fail.list6 & method.x == "SCEBE") %>% arrange(desc(method.x)))
+p92 = new_plot_function(inc.full.res5 %>% filter(!iter %in% gallop.fail.list6) %>% arrange(desc(method.x)))
+
+p9 = ggarrange(p91,p92,nrow=2,labels=c("A","B"))
+ggsave(filename = "increasingIncreasing.jpg", plot = p9, width = 210, height = 297, units = "mm")
+
+write.csv(inc.full.res5, "increasingIncreasing.csv", row.names = F)
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = cs.t, colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "t-statistic")
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = ifelse(cs.se < 0.004 & cs.se > 0, cs.se, NA), colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "standard errors")
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00005,0.005,0.00005), each=3), y = lon.t, colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "t-statistic")
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00005,0.005,0.00005), each=3), y = ifelse(lon.se < 0.004 & lon.se > 0.002, lon.se, NA), colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "standard errors")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:100){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.05*0.01*i, large.lon = -0.01*0.01*i+rnorm(1,0,0.0005), n.sd = 0.1)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+inc.res.list5 = map(fail.list, f2)
+inc.res.df5 = map_df(inc.res.list5, f3)
+
+inc.df.fr5 = data.frame(t(matrix(unlist(map(fail.list, f)), nrow = 6, ncol = 100)))
+colnames(inc.df.fr5) = c("MAF", "LMM", "GALLOP", "SCEBE", "SCEBE.CS", "SCEBE.LON")
+inc.df.fr5$scen = "increasingIncreasing"
+
+# df.fr
+# inc.res.df
+
+inc.res.lmm5 = inc.res.df5 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "LMM")
+colnames(inc.res.lmm5) = c("SNP", "lmm.cs.est", "lmm.cs.se", "lmm.cs.t", "lmm.cs.pval", "lmm.lon.est", "lmm.lon.se", "lmm.lon.t", "lmm.lon.pval", "method", "iter")
+inc.res.scebe5 = inc.res.df5 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "SCEBE")
+inc.res.gallop5 = inc.res.df5 %>% mutate(iter = rep(1:100, each=300)) %>% filter(method == "GALLOP")
+inc.full.res5 = rbind(left_join(inc.res.scebe5, inc.res.lmm5, by  = join_by(iter, SNP)), left_join(inc.res.gallop5, inc.res.lmm5, by  = join_by(iter, SNP)))
+
+#inc.full.res4
+#inc.df.fr4
+
+gallop.fail.list6 = inc.full.res5 %>% mutate(sing.flag = ifelse(method.x == "GALLOP" & is.na(cs.est), 1, 0)) %>% filter(sing.flag == 1) %>% dplyr::select(iter) %>% pull() %>% unique()
+
+inc.full.res5 = inc.full.res5 %>% mutate(method.x = factor(method.x, levels = c("SCEBE", "GALLOP")))
+
+p91 = new_plot_function(inc.full.res5 %>% filter(iter %in% gallop.fail.list6 & method.x == "SCEBE") %>% arrange(desc(method.x)))
+p92 = new_plot_function(inc.full.res5 %>% filter(!iter %in% gallop.fail.list6) %>% arrange(desc(method.x)))
+
+p9 = ggarrange(p91,p92,nrow=2,labels=c("A","B"))
+ggsave(filename = "increasingIncreasing.jpg", plot = p9, width = 210, height = 297, units = "mm")
+
+write.csv(inc.full.res5, "increasingDecreasing.csv", row.names = F)
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = cs.t, colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "t-statistic")
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = ifelse(cs.se < 0.004 & cs.se > 0, cs.se, NA), colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "standard errors")
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = lon.t, colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "t-statistic")
+
+ggplot(inc.res.df5[c(seq(1,300)*100-99),], aes(x = rep(seq(0.00025,0.025,0.00025), each=3), y = ifelse(lon.se < 0.004 & lon.se > 0.002, lon.se, NA), colour = method)) +
+  geom_point(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "standard errors")
+```
+
+```{r echo=FALSE}
+# fail rates table for all
+Fail.rate.table = rbind(rbind(rbind(rbind(fr, inc.df.fr), inc.df.fr2), inc.df.fr3), inc.df.fr4) %>% mutate(scebe.cs.when.gallop = ifelse(GALLOP == 1, SCEBE.CS, NA),
+                                                                                         scebe.lon.when.gallop = ifelse(GALLOP == 1, SCEBE.LON, NA),
+                                                                                         scebe.cs.no.gallop = ifelse(GALLOP == 0, SCEBE.CS,NA),
+                                                                                         scebe.lon.no.gallop = ifelse(GALLOP == 0, SCEBE.LON, NA)) %>% group_by(scen) %>% summarise(GALLOP = mean(GALLOP), SCEBE = mean(SCEBE), SCEBE.fr.cs.gallop = mean(scebe.cs.when.gallop, na.rm = T), SCEBE.fr.lon.gallop = mean(scebe.lon.when.gallop, na.rm = T), SCEBE.fr.cs.no.gallop = mean(scebe.cs.no.gallop, na.rm=T), SCEBE.fr.lon.no.gallop = mean(scebe.lon.no.gallop, na.rm = T))
+
+write.csv(Fail.rate.table, "fr.table.csv", row.names = F)
+```
+
+```{r echo=FALSE}
+# printing method functions
+lmm_function1 = function(phenoData, SNP.matrix, SNP.names){
+  
+  #phenoData = data.snp
+  colnames(phenoData) = c("ID", "Sex", "Time", "Height", "Weight")
+  phenoData$Time = phenoData$Time - mean(phenoData$Time, na.rm=T)  # centre time to "To deal with potential multicolinearity caused by adding interaction effect of SNP x time"
+  
+  ns = ncol(SNP.matrix)
+  out.lmm = matrix(rep(NA, ns*8), ncol = 8) 
+  
+  ## start time here
+  start.time = Sys.time()
+  
+  for(i in 1:ncol(SNP.matrix)){
+    
+    j.df = left_join(phenoData, data.frame(SNP.matrix[,i], ID = as.numeric(row.names(SNP.matrix))), join_by(ID))
+    colnames(j.df) = c("ID", "Sex", "Time", "Height", "Weight", "SNP")
+    mod1 = suppressWarnings(lmer(Weight ~ SNP*Time + Sex + Height + (Time | ID), data = j.df))
+    out.lmm[i,] = c(coef(summary(mod1))[2,], -(pnorm(-abs(coef(summary(mod1))[2,3]), log.p = TRUE))*log10(exp(1))-log10(2),coef(summary(mod1))[6,], -(pnorm(-abs(coef(summary(mod1))[6,3]), log.p = TRUE))*log10(exp(1))-log10(2))
+    if(i == 1){
+      print(summary(mod1))
+      save.mod = mod1
+      }
+  }
+  
+  ## end time here
+  end.time = Sys.time()
+  
+  out.lmm = data.frame(SNP = SNP.names, out.lmm)
+  colnames(out.lmm) = c("SNP","cs.est", "cs.se", "cs.t", "cs.pval", "lon.est", "lon.se", "lon.t", "lon.pval")
+  
+  out.list = list(
+    output = out.lmm,
+    time.taken.total = end.time - start.time,
+    mod = save.mod
+  )
+  
+  return(out.list)
+  
+}
+
+gallop_function1 = function(phenoData, SNP.matrix, SNP.names, k = 6){
+  
+  #phenoData = data.snp
+  colnames(phenoData) = c("ID", "Sex", "Time", "Height", "Weight")
+  #genoData = SNP.matrix
+  
+  phenoData$Time = phenoData$Time - mean(phenoData$Time, na.rm=T)  # centre time to "To deal with potential multicolinearity caused by adding interaction effect of SNP x time"
+  
+  ## start time here
+  start.time = Sys.time()
+  
+  mod1 = lmer(Weight ~ Time + Sex + Height + (Time | ID), data = phenoData, na.action = "na.omit")
+  phenoData = phenoData[,-1] # remove ID column
+  phenoData[is.na(phenoData)] <- 0 # set NAs as 0, as per GALLOP paper
+  
+  # print model when i = 2
+  if(i == 2){
+    print(summary(mod1))
+  }
+  
+  # Extract variance components and compute penalty matrix (P)
+  varcor = VarCorr(mod1)
+  G = varcor$ID
+  sig = attr(varcor, "sc")
+  P = solve(G / sig ^ 2)
+  
+  # Put data in convenient arrays and vector
+  TT =  cbind(1, phenoData[, "Time"]) # matrix with column of ones and time at each measurement
+  nxy = ncol(phenoData)
+  X = as.matrix(cbind(1, phenoData[ , -nxy])) # data matrix with no ID or outcome column
+  nx = ncol(X)
+  y = phenoData[ , nxy] # outcome
+  
+  # Compute components of block-diagonal system with covariates  (without SNP)
+  # Additionally compute and store object SS = Rot %*% Si, which is used later on
+  ncov = 2 # number of covariates
+  n = nrow(SNP.matrix) # number of individuals
+  k = k # maximum number of outcome measurements for an individual
+  
+  A21 = matrix(NA, 2 * n , 2 + ncov)
+  q2  = rep(NA, 2 * n)
+  SS = matrix(NA, 2 * n , 2)
+  
+  for (i in 1 : n ) {
+    
+    uk = (i - 1) * k + (1 : k)
+    u2 = (i - 1) * 2 + (1 : 2)
+    Ti = TT[uk, ]
+    Si = crossprod(Ti, Ti)
+    sv = svd(Si + P)
+    Rot = sqrt(1 /sv$d) * sv$u
+    Q = Rot %*% t(Ti)
+    SS[u2, ] = Rot %*% Si
+    A21[u2, ] = Q %*% X[uk,  ]
+    q2[u2] = Q %*% y[uk]
+  }
+  
+  q1 = crossprod(X, y)
+  A11 = crossprod(X)
+  # Solve the system (20)
+  Q = A11 - crossprod(A21)
+  q = q1 - crossprod(A21, q2)
+  sol = solve(Q, q)
+  blups = q2 - A21 %*% sol
+  
+  # Compute sums of products per subject involved in the crossprod(X, G), crossprod(G) and crossprod(G, y). We use row-wise Kronecker product to avoid repeating SNP vector k times
+  ex = matrix(1, 1, ncov + 2)
+  et = matrix(1, 1, 2)
+  XTk = kronecker(et, X) * kronecker(TT, ex) ## check here for how GALLOP handles TVC
+  TTk = kronecker(et, TT) * kronecker(TT, et)
+  Tyk = y * TT
+  XTs = matrix(0, n, ncol(XTk))
+  TTs = matrix(0, n, ncol(TTk))
+  Tys = matrix(0, n, 2)
+  AtS = matrix(0, n, 2 * nx)
+  for (i in 1:n) {
+    uk = (i - 1) * k + (1 : k)
+    XTs[i, ] = apply(XTk[uk, ], 2, sum)
+    TTs[i, ] = apply(TTk[uk, ], 2, sum)
+    Tys[i, ] = apply(Tyk[uk, ], 2, sum)
+    u2 = (i - 1) * 2 + (1 : 2)
+    AtS[i, ] = c(crossprod(A21[u2, ], SS[u2, ]))
+  }
+  
+  ## SNPs start here
+  end.oneoff.time = Sys.time()
+  
+  SNPS = SNP.matrix
+  ns = ncol(SNPS)
+  
+  # Add SNPs one by one and solve
+  Theta = D = matrix(NA, ns, 2)
+  for (i in 1 : ns) {
+    si = SNPS[, i]
+    snp2 = rep(si, each = 2)
+    H1 = matrix(crossprod(si, XTs), nx, 2)
+    H2 = snp2 * SS
+    AtH = matrix(crossprod(si, AtS), nx, 2)
+    R = H1 - AtH
+    Cfix = solve(Q, R)
+    Cran = H2 - A21 %*% Cfix
+    GtG = matrix(crossprod(si ^ 2, TTs), 2, 2)
+    Gty = matrix(crossprod(si, Tys), 2, 1)
+    V = GtG - crossprod(H1, Cfix) - crossprod(H2, Cran)
+    v = Gty - crossprod(H1, sol) - crossprod(H2, blups)
+    Theta[i , ] = solve(V, v)
+    D[i, ] = diag(solve(V))
+  }
+  
+  # sig2 is sigma squared
+  
+  SE = sqrt(sig**2) * sqrt(D) # random effect covariance D is underestimated when there is a genetic effect.
+  Pval = -pnorm(-abs(Theta / SE), log.p = T)*log10(exp(1))-log10(2)
+  
+  print(Theta[1,1])
+  print(SE[1,1])
+  
+  ## end time here
+  end.time = Sys.time()
+  
+  # create output dataframe
+  gallop.out.df = data.frame(
+    SNP = SNP.names,
+    cs.est = Theta[,1],
+    cs.se = SE[,1],
+    cs.t = Theta[,1] / SE[,1],
+    cs.pval = Pval[,1],
+    lon.est = Theta[,2],
+    lon.se = SE[,2],
+    lon.t = Theta[,2] / SE[,2],
+    lon.pval = Pval[,2]
+  )
+  
+  out.list = list(
+    output = gallop.out.df,
+    time.taken.oneoff = end.oneoff.time - start.time,
+    time.taken.SNPs = end.time - end.oneoff.time,
+    time.taken.total = end.time - start.time
+  )
+  return(out.list)
+  
+}
+
+scebe_function1 = function(phenoData, SNP.matrix, SNP.names){
+  
+  # phenoData = data.snp
+  colnames(phenoData) = c("ID", "Sex", "Time", "Height", "Weight")
+  #mod.lm = phenoData %>% lm(formula = Weight ~ Sex) # move out of function to compare
+  #phenoData$Weight = mod.lm$residuals 
+  
+  phenoData$Time = phenoData$Time - mean(phenoData$Time, na.rm=T)
+  phenoData = phenoData %>% dplyr::select(ID,Weight,Height,Sex,Time)
+  
+  N = nrow(SNP.matrix)
+  noCov = ncol(SNP.matrix)
+  n_measure = phenoData %>% dplyr::group_by(ID) %>% dplyr::summarize(n=length(ID))%>%dplyr::select(n)%>%unlist()
+  IDs = phenoData$ID
+  
+  ## start time here
+  start.time = Sys.time()
+  
+  mod1 = lmer(Weight ~ Time + Sex + Height + (Time | ID), data = phenoData, na.action = "na.omit")
+  # remove
+  # if(i == 2){
+  #  print(summary(mod1))
+  #}
+  
+  
+  flme0<-summary(mod1)
+  rf=ranef(mod1)$ID
+  r.name=rownames(rf)
+  rf1=data.frame(ID=as.numeric(r.name),rf) %>% arrange(ID)
+  rf = rf1[, -which(names(rf1)=="ID")]
+  # ind.parm <- merge(phenoData[!duplicated(phenoData$ID),c("ID",paste0("cov",1:noCov))],rf1,by="ID")
+  # names(ind.parm)[c(2+noCov,3+noCov)]=c("Inter","Slope")
+  names(rf)[c(1:2)]=c("Inter","Slope")
+  
+  # y1: rf$Inter,
+  # y2: rf$Slope
+  # X: as.matrix(genoData)
+  
+  ## NEBE with SNPS starts here <-----------------------------------------------
+  int1.time = Sys.time()
+  
+  y1 = rf$Inter
+  y2 = rf$Slope
+  X = as.matrix(SNP.matrix)
+  
+  n1 <- length(y1)
+  n<-n2<-n1
+  
+  y1bar <- mean(y1)
+  y2bar <- mean(y2)
+  
+  y1c <- y1 - y1bar
+  y2c <- y2 - y2bar
+  s1 <- colSums(X)
+  s2 <- colSums(X ^ 2)
+  sxx <- (s2 - (s1 ^ 2) / n)
+  
+  b1 <- as.vector(colSums(y1c*X) / sxx)
+  b2 <- as.vector(colSums(y2c*X) / sxx)
+  y1_sum <- sum(y1)
+  y2_sum <- sum(y2)
+  y1X <- colSums(y1 * X)
+  y2X <- colSums(y2 * X)
+  
+  #Residuals1 <- (y1 - X %*% diag(b1) - t(replicate(n1, a1))) ## still potential for improvement
+  #b1_sd <- sqrt((colSums(Residuals1 ^ 2) / (n1 - 2)) / sxx)
+  #Residuals2 <- (y2 - X %*% diag(b2) - t(replicate(n2, a2))) ## still potential for improvement
+  #b2_sd <- sqrt((colSums(Residuals2 ^ 2) / (n2 - 2)) / sxx)
+  
+  sigma11 = sum(y1 ^ 2) - (y1_sum ^ 2 * s2 - 2 * s1 * y1_sum * y1X + 
+                             n * (y1X) ^ 2) / (n * sxx)
+  var.gamma11 = sigma11 / (sxx * (n - 2))
+  
+  #sigma12 = sum(y1 * y2) - (y1_sum * y2_sum * s2 - y2_sum * s1 * y1X - 
+  #                           y1_sum * s1 * y2X + n * y1X * y2X) / (n * sxx)
+  #var.gamma12 = sigma12 / (sxx * (n - 2))
+  
+  sigma22 = sum(y2 ^ 2) - (y2_sum ^ 2 * s2 - 2 * s1 * y2_sum * y2X + 
+                             n * (y2X) ^ 2) / (n * sxx)
+  var.gamma22 = sigma22 / (sxx * (n - 2))
+  
+  b1_sd=sqrt(var.gamma11)
+  b2_sd=sqrt(var.gamma22)
+  
+  
+  t1_value <- b1 / b1_sd
+  p1_value <- pt(q = -abs(t1_value), df =  n1 - 2) * 2 # Pr(>|t|)
+  
+  t2_value <- b2 / b2_sd
+  p2_value <- pt(q = -abs(t2_value), df =  n2 - 2) * 2 # Pr(>|t|)
+  
+  
+  result <- cbind(b1, b1_sd, p1_value,b2, b2_sd,  p2_value)
+  colnames(result) <- c("b1_Est", "b1_Std",  "Pr1(>|t|)","b2_Est", "b2_Std",  "Pr2(>|t|)")
+  rownames(result) <- colnames(X)
+  
+  # nebe with SNPs ends here <--------------------------------------------------
+  int2.time = Sys.time()
+  
+  spr = result
+  
+  Data=phenoData
+  R=matrix(as.numeric(VarCorr(mod1)$ID),ncol=2)
+  Ip=diag(1,2)
+  # print(R)
+  
+  #allS=allW=list()
+  #allM=allISMIS=list()	  
+  alls11=alls12=alls21=alls22=NULL
+  allw11=allw12=allw21=allw22=NULL
+  allsms11=allsms12=allsms21=allsms22=NULL
+  
+  Time.lst = split(Data[["Time"]], Data[["ID"]])
+  
+  #print(Time.lst)
+  
+  for(i in 1:N){ ## this loop does not involve SNPs, I believe
+    nt = n_measure[i]
+    time <- Time.lst[[i]] #Data[Data$ID ==i, Time]##
+    Zi <- cbind(1, time)
+    Gi = diag(sigma(mod1) ^ 2, nt)
+    ZinvGZ <- crossprod(Zi, solve(Gi, Zi)) ##when n measure==1, return error!
+    Mi=R+ginv(ZinvGZ)
+    
+    SIGMAi=Zi%*%R%*%t(Zi)+Gi
+    Wi <- crossprod(Zi, solve(SIGMAi, Zi))
+    #allW[[i]]=Wi
+    allw11=c(allw11,Wi[1,1])
+    allw12=c(allw12,Wi[1,2])
+    allw21=c(allw21,Wi[2,1])
+    allw22=c(allw22,Wi[2,2])
+    
+    
+    
+    invSi <- R %*% ZinvGZ + Ip
+    Si=solve(invSi)
+    alls11<-c(alls11,Si[1,1])
+    alls12<-c(alls12,Si[1,2])
+    alls21<-c(alls21,Si[2,1])
+    alls22<-c(alls22,Si[2,2])
+    
+    Ipi=diag(1,2)
+    SMS=(Ipi-Si)%*%Mi%*%t(Ipi-Si)
+    
+    allsms11<-c(allsms11,SMS[1,1])
+    allsms12<-c(allsms12,SMS[1,2])
+    allsms21<-c(allsms21,SMS[2,1])
+    allsms22<-c(allsms22,SMS[2,2])
+    
+  }
+  
+  C<-matrix(c(sum(allw11),sum(allw12),sum(allw21),sum(allw22)),2,byrow=T)
+  
+  inv_C<-solve(C)
+  # print(inv_C)
+  
+  invc11<-inv_C[1,1]
+  invc12<-inv_C[1,2]
+  invc21<-inv_C[2,1]
+  invc22<-inv_C[2,2]
+  
+  ebe<-spr[,c(1,4)]
+  
+  # SNP section starts here
+  end.oneoff.time = Sys.time()
+  
+  myX<-SNP.matrix #unique(phenoData[,5:(noCov+4)]) ## SNPs start again here
+  Xc<-apply(myX,2,function(x){scale(x,scale=F)})
+  
+  XcX<-Xc*myX
+  Xc2<-Xc^2
+  Sxc2<-colSums(Xc2)
+  
+  xstar11<-colSums(allw11*Xc)
+  xstar12<-colSums(allw12*Xc)
+  xstar21<-colSums(allw21*Xc)
+  xstar22<-colSums(allw22*Xc)
+  
+  A11<-colSums(Xc2*alls11)/Sxc2
+  A12<-colSums(Xc2*alls12)/Sxc2
+  A21<-colSums(Xc2*alls21)/Sxc2
+  A22<-colSums(Xc2*alls22)/Sxc2
+  
+  B11<-colSums(Xc*alls11)/Sxc2
+  B12<-colSums(Xc*alls12)/Sxc2
+  B21<-colSums(Xc*alls21)/Sxc2
+  B22<-colSums(Xc*alls22)/Sxc2
+  
+  Sxc22<-(Sxc2)^2
+  
+  D11=colSums(Xc2*allsms11)/Sxc22
+  D12=colSums(Xc2*allsms12)/Sxc22
+  D21=colSums(Xc2*allsms21)/Sxc22
+  D22=colSums(Xc2*allsms22)/Sxc22
+  
+  
+  
+  ssh211<-B11*invc11*xstar11+B12*invc21*xstar11+B11*invc12*xstar21+B12*invc22*xstar21
+  ssh212<-B11*invc11*xstar12+B12*invc21*xstar12+B11*invc12*xstar22+B12*invc22*xstar22
+  ssh221<-B21*invc11*xstar11+B22*invc21*xstar11+B21*invc12*xstar21+B22*invc22*xstar21
+  ssh222<-B21*invc11*xstar12+B22*invc21*xstar12+B21*invc12*xstar22+B22*invc22*xstar22
+  
+  ssh11=1-A11+ssh211
+  ssh12=0-A12+ssh212
+  ssh21=0-A21+ssh221
+  ssh22=1-A22+ssh222
+  
+  # print(c(ssh11[100], ssh12[100], ssh21[100], ssh22[100]))
+  
+  detssh=ssh11*ssh22-ssh12*ssh21
+  
+  # print(sprintf("%.35f",ssh11[100]))
+  # print(sprintf("%.35f",ssh22[100]))
+  # print(sprintf("%.35f",ssh12[100]))
+  # print(sprintf("%.35f",ssh21[100]))
+  # print((ssh11*ssh22)[100])
+  # print(sprintf("%.35f",(ssh11*ssh22)[100]))
+  # print((ssh12*ssh21)[100])
+  # print(sprintf("%.35f",(ssh12*ssh21)[100]))
+  # print(detssh[100])
+  
+  invssh11<-ssh22/detssh
+  invssh12<-(-ssh12/detssh)
+  invssh21<-(-ssh21/detssh)
+  invssh22<-ssh11/detssh
+  
+  Vgamma211<-B11*invc11*B11+B12*invc21*B11+B11*invc12*B12+B12*invc22*B12
+  #Vgamma211<-Vgamma211/SXc2
+  Vgamma212<-B11*invc11*B21+B12*invc21*B21+B11*invc12*B22+B12*invc22*B22
+  #Vgamma212<-Vgamma212/SXc2
+  Vgamma221<-B21*invc11*B11+B22*invc21*B11+B21*invc12*B12+B22*invc22*B12
+  #Vgamma221<-Vgamma221/SXc2
+  Vgamma222<-B21*invc11*B21+B22*invc21*B21+B21*invc12*B22+B22*invc22*B22
+  #Vgamma222<-Vgamma222/SXc2
+  
+  Vgamma11=D11-Vgamma211
+  Vgamma12=D12-Vgamma212
+  Vgamma21=D21-Vgamma221
+  Vgamma22=D22-Vgamma222 ###VAR of NEBE
+  
+  Vssh11<-invssh11*Vgamma11*invssh11+invssh12*Vgamma21*invssh11+invssh11*Vgamma12*invssh12+invssh12*Vgamma22*invssh12
+  Vssh12<-invssh11*Vgamma11*invssh21+invssh12*Vgamma21*invssh21+invssh11*Vgamma12*invssh22+invssh12*Vgamma22*invssh22
+  Vssh21<-invssh21*Vgamma11*invssh11+invssh22*Vgamma21*invssh11+invssh21*Vgamma12*invssh12+invssh22*Vgamma22*invssh12
+  Vssh22<-invssh21*Vgamma11*invssh21+invssh22*Vgamma21*invssh21+invssh21*Vgamma12*invssh22+invssh22*Vgamma22*invssh22
+  
+  # remove
+  # print(c(invssh11[100], invssh12[100], invssh21[100], invssh22[100]))
+  # print(c(Vgamma11[100], Vgamma12[100], Vgamma21[100], Vgamma22[100]))
+  # print(c(Vssh11[100], Vssh12[100], Vssh21[100], Vssh22[100]))
+  
+  # addition for single SNP input ---------------------------------------------<
+#  ebe = matrix(ebe, ncol = 2)
+  
+  est.ssh.inter<-invssh11*ebe[,1]+invssh12*ebe[,2]
+  est.ssh.slope<-invssh21*ebe[,1]+invssh22*ebe[,2]
+  
+  t.ssh.inter<-est.ssh.inter/sqrt(Vssh11)
+  t.ssh.slope<-est.ssh.slope/sqrt(Vssh22)
+  
+  p.ssh.inter<- -pnorm(abs(t.ssh.inter),lower.tail=F,log.p = T)*log10(exp(1))-log10(2)
+  p.ssh.slope<- -pnorm(abs(t.ssh.slope),lower.tail=F,log.p = T)*log10(exp(1))-log10(2)
+  
+  # print(is.na(p.ssh.inter)[100])
+  # print(is.na(p.ssh.slope)[100])
+  print(est.ssh.inter[1])
+  print(sqrt(Vssh11)[1])
+  
+  ## end time here
+  end.time = Sys.time()
+  
+  output<-cbind(est.ssh.inter,sqrt(Vssh11),p.ssh.inter,t.ssh.inter,est.ssh.slope,sqrt(Vssh22),p.ssh.slope,t.ssh.slope)
+  
+  colnames(output)= c("est.sc.b1", "se.sc.b1", "p.sc.b1", "t.sc.b1",
+                      "est.sc.b2", "se.sc.b2", "p.sc.b2", "t.sc.b2")
+  
+  out.scebe.res = data.frame(SNP = SNP.names, matrix(output[,c(1:2,4,3,5:6,8,7)], ncol = 8))
+  row.names(out.scebe.res) = seq(1,nrow(out.scebe.res),1)
+  colnames(out.scebe.res) = c("SNP","cs.est", "cs.se", "cs.t", "cs.pval", "lon.est", "lon.se", "lon.t", "lon.pval")
+  
+  out.list = list(
+    output = out.scebe.res,
+    time.taken.oneoff = int1.time - start.time + end.oneoff.time - int2.time,
+    time.taken.SNPs = end.time - end.oneoff.time + int2.time - int1.time,
+    time.taken.total = end.time - start.time
+  )
+  
+  return(out.list)
+  
+}
+```
+
+```{r echo=FALSE, message=FALSE}
+## test investigate insides
+
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:2){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.005, large.lon = 0.005*0.01*i, n.sd = 0.1)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = suppressWarnings(lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix))),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+```
+
+
+```{r echo=FALSE}
+set.seed(2512)
+
+fail.list = list()
+for(i in 1:2){
+  
+  SNPs.out = simulate_SNPs(N.SNP = 100, linear.df, MAF.unif.min = 0.3, MAF.unif.max = 0.3)
+
+  SNP.effects.out = linear.df %>% simulate_SNP_effects(SNPs.out$SNP.matrix,
+                                                     cross.unif.lower = 0, cross.unif.higher = 0, 
+                                                     long.unif.lower = 0, long.unif.higher = 0,
+                                                     large.cs = 0.05, large.lon = 0, n.sd = 0.1)
+
+  SNP.effects.out$data.SNP.effects = SNP.effects.out$data.SNP.effects %>% dplyr::select(-Wave)
+  
+  out.list = list(maf = SNPs.out$SNP.MAFs[1],
+                  lmm = suppressMessages(lmm_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix))),
+                  gallop = gallop_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)),
+                  scebe = scebe_tryCatch(SNP.effects.out$data.SNP.effects, SNPs.out$SNP.matrix, colnames(SNPs.out$SNP.matrix)))
+  fail.list[[i]] = out.list
+}
+
+```
